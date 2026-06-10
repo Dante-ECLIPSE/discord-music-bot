@@ -443,20 +443,21 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.reply({ embeds: [embed] });
   }
 
-  if (commandName === 'play') {
+ if (commandName === 'play') {
     const query = options.getString('query');
     const voiceChannel = member.voice?.channel;
     if (!voiceChannel) return interaction.reply({ content: '❌ Join a voice channel first!', ephemeral: true });
 
-    await interaction.deferReply();
+    // Defer IMMEDIATELY before anything else
+    try { await interaction.deferReply(); } catch { return; }
     q.textChannel = channel;
 
     try {
       if (!q.connection) await joinChannel(voiceChannel, guildId);
-    } catch {
-      return interaction.editReply('❌ Could not join your voice channel.');
+    } catch (err) {
+      console.error('Join error:', err);
+      return interaction.editReply('❌ Could not join your voice channel. Try again!');
     }
-
     const tracks = await resolveTracks(query);
     if (!tracks || !tracks.length) return interaction.editReply('❌ No results found.');
 
