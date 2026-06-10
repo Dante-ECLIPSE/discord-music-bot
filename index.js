@@ -305,15 +305,33 @@ function setupPlayer(guildId) {
 
 async function joinChannel(voiceChannel, guildId) {
   const q = getQueue(guildId);
+
+  // If already connected, reuse
+  if (q.connection) {
+    const status = q.connection.state.status;
+    if (status !== VoiceConnectionStatus.Destroyed) {
+      const player = setupPlayer(guildId);
+      q.connection.subscribe(player);
+      return q.connection;
+    }
+  }
+
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId,
     adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+    selfDeaf: true,
   });
 
-  await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-  q.connection = connection;
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000); // increased to 30s
+  } catch (err) {
+    connection.destroy();
+    queues.delete(guildId);
+    throw new Error('Could not connect to voice channel');
+  }
 
+  q.connection = connection;
   const player = setupPlayer(guildId);
   connection.subscribe(player);
 
@@ -331,7 +349,6 @@ async function joinChannel(voiceChannel, guildId) {
 
   return connection;
 }
-
 // ─── Slash Commands ──────────────────────────────────────────────────────────
 const commands = [
   new SlashCommandBuilder().setName('play').setDescription('Play music from YouTube, Spotify, SoundCloud, or search query')
