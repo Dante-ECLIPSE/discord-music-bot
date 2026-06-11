@@ -1,13 +1,12 @@
 const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState, getVoiceConnection } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState, NoSubscriberBehavior, StreamType } = require('@discordjs/voice');
 const ytdl = require('@distube/ytdl-core');
 const ytSearch = require('yt-search');
 const SpotifyWebApi = require('spotify-web-api-node');
-const { exec } = require('child_process');
-const path = require('path');
+const { exec, spawn } = require('child_process');
 require('dotenv').config();
 
-// ─── Client Setup ───────────────────────────────────────────────────────────
+// ─── Discord Client ───────────────────────────────────────────────────────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -17,575 +16,453 @@ const client = new Client({
   ],
 });
 
-// ─── Spotify Setup ──────────────────────────────────────────────────────────
+// ─── Spotify ──────────────────────────────────────────────────────────────────
 const spotifyApi = new SpotifyWebApi({
-  clientId: process.env.SPOTIFY_CLIENT_ID,
-  clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+  clientId: process.env.SPOTIFY_CLIENT_ID || '',
+  clientSecret: process.env.SPOTIFY_CLIENT_SECRET || '',
 });
-
 async function refreshSpotifyToken() {
+  if (!process.env.SPOTIFY_CLIENT_ID) return;
   try {
     const data = await spotifyApi.clientCredentialsGrant();
     spotifyApi.setAccessToken(data.body['access_token']);
     setTimeout(refreshSpotifyToken, (data.body['expires_in'] - 60) * 1000);
-  } catch (err) {
-    console.error('Spotify token error:', err.message);
-    setTimeout(refreshSpotifyToken, 30000);
+  } catch (e) {
+    setTimeout(refreshSpotifyToken, 60000);
   }
 }
 
-// ─── Queue Manager ───────────────────────────────────────────────────────────
-const queues = new Map(); // guildId -> GuildQueue
-
+// ─── Queue ────────────────────────────────────────────────────────────────────
+const queues = new Map();
 function getQueue(guildId) {
   if (!queues.has(guildId)) {
     queues.set(guildId, {
-      tracks: [],
-      player: null,
-      connection: null,
-      current: null,
-      loop: false,
-      loopQueue: false,
-      volume: 80,
-      textChannel: null,
-      nowPlayingMsg: null,
+      tracks: [], player: null, connection: null,
+      current: null, loop: false, loopQueue: false,
+      volume: 80, textChannel: null, nowPlayingMsg: null,
+      retries: 0,
     });
   }
   return queues.get(guildId);
 }
 
-// ─── URL Detectors ───────────────────────────────────────────────────────────
-function isYouTubeURL(url) {
-  return /(?:youtube\.com|youtu\.be)/i.test(url);
+// ─── Utils ────────────────────────────────────────────────────────────────────
+function fmt(sec) {
+  if (!sec || isNaN(sec)) return '?:??';
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
 }
-function isSpotifyURL(url) {
-  return /open\.spotify\.com/i.test(url);
-}
-function isSoundCloudURL(url) {
-  return /soundcloud\.com/i.test(url);
-}
+const isYT = u => /(?:youtube\.com|youtu\.be)/i.test(u);
+const isSP = u => /open\.spotify\.com/i.test(u);
+const isSC = u => /soundcloud\.com/i.test(u);
 
-// ─── Track Resolvers ─────────────────────────────────────────────────────────
-
-async function resolveYouTubeURL(url) {
-  try {
-    const info = await ytdl.getInfo(url);
-    return [{
-      title: info.videoDetails.title,
-      url: url,
-      duration: formatDuration(parseInt(info.videoDetails.lengthSeconds)),
-      thumbnail: info.videoDetails.thumbnails[0]?.url,
-      source: 'youtube',
-    }];
-  } catch {
-    return null;
-  }
-}
-
-async function resolveYouTubePlaylist(url) {
-  try {
-    const playlistId = url.match(/[?&]list=([^&]+)/)?.[1];
-    if (!playlistId) return null;
-    const r = await ytSearch({ listId: playlistId });
-    return r.videos.map(v => ({
-      title: v.title,
-      url: v.url,
-      duration: v.duration.timestamp,
-      thumbnail: v.thumbnail,
-      source: 'youtube',
-    }));
-  } catch {
-    return null;
-  }
-}
-
-async function resolveSpotifyTrack(url) {
-  const trackId = url.match(/track\/([A-Za-z0-9]+)/)?.[1];
-  if (!trackId) return null;
-  try {
-    const data = await spotifyApi.getTrack(trackId);
-    const t = data.body;
-    const query = `${t.name} ${t.artists.map(a => a.name).join(' ')}`;
-    return [await searchYouTube(query, 'spotify', t.album?.images[0]?.url)];
-  } catch {
-    return null;
-  }
-}
-
-async function resolveSpotifyPlaylist(url) {
-  const playlistId = url.match(/playlist\/([A-Za-z0-9]+)/)?.[1];
-  if (!playlistId) return null;
-  try {
-    const data = await spotifyApi.getPlaylistTracks(playlistId, { limit: 50 });
-    const tracks = [];
-    for (const item of data.body.items) {
-      const t = item.track;
-      if (!t) continue;
-      const query = `${t.name} ${t.artists.map(a => a.name).join(' ')}`;
-      const track = await searchYouTube(query, 'spotify', t.album?.images[0]?.url);
-      if (track) tracks.push(track);
-    }
-    return tracks;
-  } catch {
-    return null;
-  }
-}
-
-async function resolveSpotifyAlbum(url) {
-  const albumId = url.match(/album\/([A-Za-z0-9]+)/)?.[1];
-  if (!albumId) return null;
-  try {
-    const data = await spotifyApi.getAlbumTracks(albumId, { limit: 50 });
-    const albumInfo = await spotifyApi.getAlbum(albumId);
-    const thumb = albumInfo.body.images[0]?.url;
-    const tracks = [];
-    for (const t of data.body.items) {
-      const query = `${t.name} ${t.artists.map(a => a.name).join(' ')}`;
-      const track = await searchYouTube(query, 'spotify', thumb);
-      if (track) tracks.push(track);
-    }
-    return tracks;
-  } catch {
-    return null;
-  }
-}
-
-async function resolveSoundCloudURL(url) {
-  // yt-dlp handles SoundCloud
-  return new Promise((resolve) => {
-    exec(`yt-dlp --print title --print duration --no-playlist "${url}"`, (err, stdout) => {
-      if (err) return resolve(null);
-      const lines = stdout.trim().split('\n');
-      const title = lines[0] || 'Unknown Title';
-      const duration = lines[1] ? formatDuration(parseInt(lines[1])) : '?:??';
-      resolve([{ title, url, duration, thumbnail: null, source: 'soundcloud' }]);
-    });
-  });
-}
-
-async function searchYouTube(query, source = 'youtube', thumb = null) {
+// ─── Resolvers ────────────────────────────────────────────────────────────────
+async function searchYT(query, source = 'youtube', thumb = null) {
   try {
     const r = await ytSearch(query);
     const v = r.videos[0];
     if (!v) return null;
-    return {
-      title: v.title,
-      url: v.url,
-      duration: v.duration.timestamp,
-      thumbnail: thumb || v.thumbnail,
-      source,
-    };
-  } catch {
-    return null;
-  }
+    return { title: v.title, url: v.url, duration: v.duration.timestamp, thumbnail: thumb || v.thumbnail, source };
+  } catch { return null; }
 }
 
-function formatDuration(seconds) {
-  if (isNaN(seconds)) return '?:??';
-  const m = Math.floor(seconds / 60);
-  const s = String(seconds % 60).padStart(2, '0');
-  return `${m}:${s}`;
-}
-
-// ─── Resolve any input ────────────────────────────────────────────────────────
 async function resolveTracks(input) {
-  if (isYouTubeURL(input)) {
-    if (input.includes('list=')) return await resolveYouTubePlaylist(input);
-    return await resolveYouTubeURL(input);
+  if (isYT(input)) {
+    if (input.includes('list=')) {
+      try {
+        const id = input.match(/[?&]list=([^&]+)/)?.[1];
+        const r = await ytSearch({ listId: id });
+        return r.videos.map(v => ({ title: v.title, url: v.url, duration: v.duration.timestamp, thumbnail: v.thumbnail, source: 'youtube' }));
+      } catch { return null; }
+    }
+    try {
+      const info = await ytdl.getInfo(input);
+      return [{ title: info.videoDetails.title, url: input, duration: fmt(parseInt(info.videoDetails.lengthSeconds)), thumbnail: info.videoDetails.thumbnails[0]?.url, source: 'youtube' }];
+    } catch { return null; }
   }
-  if (isSpotifyURL(input)) {
-    if (input.includes('/track/')) return await resolveSpotifyTrack(input);
-    if (input.includes('/playlist/')) return await resolveSpotifyPlaylist(input);
-    if (input.includes('/album/')) return await resolveSpotifyAlbum(input);
+  if (isSP(input) && process.env.SPOTIFY_CLIENT_ID) {
+    if (input.includes('/track/')) {
+      try {
+        const id = input.match(/track\/([A-Za-z0-9]+)/)?.[1];
+        const d = await spotifyApi.getTrack(id);
+        const t = d.body;
+        return [await searchYT(`${t.name} ${t.artists.map(a=>a.name).join(' ')}`, 'spotify', t.album?.images[0]?.url)];
+      } catch { return null; }
+    }
+    if (input.includes('/playlist/')) {
+      try {
+        const id = input.match(/playlist\/([A-Za-z0-9]+)/)?.[1];
+        const d = await spotifyApi.getPlaylistTracks(id, { limit: 50 });
+        const tracks = [];
+        for (const item of d.body.items) {
+          if (!item.track) continue;
+          const t = item.track;
+          const track = await searchYT(`${t.name} ${t.artists.map(a=>a.name).join(' ')}`, 'spotify', t.album?.images[0]?.url);
+          if (track) tracks.push(track);
+        }
+        return tracks;
+      } catch { return null; }
+    }
   }
-  if (isSoundCloudURL(input)) return await resolveSoundCloudURL(input);
-  // plain search
-  const track = await searchYouTube(input);
-  return track ? [track] : null;
+  if (isSC(input)) {
+    return new Promise(resolve => {
+      exec(`yt-dlp --print title --print duration --no-playlist "${input}"`, (err, out) => {
+        if (err) return resolve(null);
+        const [title, dur] = out.trim().split('\n');
+        resolve([{ title: title || 'Unknown', url: input, duration: fmt(parseInt(dur)), thumbnail: null, source: 'soundcloud' }]);
+      });
+    });
+  }
+  const t = await searchYT(input);
+  return t ? [t] : null;
 }
 
-// ─── Audio Playback ──────────────────────────────────────────────────────────
-async function createStream(url, source) {
-  // For SoundCloud and other sites, use yt-dlp piped audio
-  if (source === 'soundcloud') {
-    const { spawn } = require('child_process');
+// ─── Stream ───────────────────────────────────────────────────────────────────
+async function createStream(track) {
+  if (track.source === 'soundcloud') {
+    const proc = spawn('yt-dlp', ['-f', 'bestaudio/best', '-o', '-', '--no-playlist', track.url]);
+    proc.stderr.on('data', d => console.error('yt-dlp:', d.toString()));
+    return createAudioResource(proc.stdout, { inputType: StreamType.Arbitrary, inlineVolume: true });
+  }
+
+  // Use yt-dlp for YouTube too — much more stable than ytdl on hosted servers
+  return new Promise((resolve, reject) => {
     const proc = spawn('yt-dlp', [
-      '-f', 'bestaudio',
-      '-o', '-',
+      '-f', 'bestaudio[ext=webm]/bestaudio/best',
       '--no-playlist',
-      url,
+      '-o', '-',
+      track.url,
     ]);
-    return createAudioResource(proc.stdout, { inlineVolume: true });
-  }
-  // YouTube
-  const stream = ytdl(url, {
-    filter: 'audioonly',
-    quality: 'highestaudio',
-    highWaterMark: 1 << 25,
+    proc.stderr.on('data', d => console.error('yt-dlp:', d.toString().trim()));
+    proc.on('error', reject);
+    // Give the stream a moment to start
+    setTimeout(() => {
+      resolve(createAudioResource(proc.stdout, { inputType: StreamType.Arbitrary, inlineVolume: true }));
+    }, 200);
   });
-  return createAudioResource(stream, { inlineVolume: true });
 }
 
+// ─── Playback ─────────────────────────────────────────────────────────────────
 async function playNext(guildId) {
   const q = getQueue(guildId);
+
   if (!q.tracks.length && !q.loopQueue) {
     q.current = null;
-    sendEmbed(q.textChannel, '⏹️ Queue finished', 'No more tracks. Use `/play` to add more!', 0x5865f2);
+    sendEmbed(q.textChannel, '⏹️ Queue finished', 'No more tracks! Use `/play` to add more.');
     return;
   }
 
-  if (q.loopQueue && q.current && !q.loop) {
-    q.tracks.push(q.current); // rotate
-  }
-
-  const track = q.loop && q.current ? q.current : q.tracks.shift();
+  if (q.loopQueue && q.current && !q.loop) q.tracks.push(q.current);
+  const track = (q.loop && q.current) ? q.current : q.tracks.shift();
   q.current = track;
+  q.retries = 0;
 
+  await attemptPlay(guildId, track);
+}
+
+async function attemptPlay(guildId, track) {
+  const q = getQueue(guildId);
   try {
-    const resource = await createStream(track.url, track.source);
+    const resource = await createStream(track);
     resource.volume?.setVolume(q.volume / 100);
     q.player.play(resource);
-    sendNowPlaying(q, track);
+    await sendNowPlaying(q, track);
   } catch (err) {
-    console.error('Playback error:', err);
-    sendEmbed(q.textChannel, '❌ Playback Error', `Could not play **${track.title}**. Skipping...`, 0xe74c3c);
-    playNext(guildId);
+    console.error('Play error:', err.message);
+    q.retries = (q.retries || 0) + 1;
+    if (q.retries < 3) {
+      console.log(`Retrying (${q.retries}/3)...`);
+      setTimeout(() => attemptPlay(guildId, track), 2000);
+    } else {
+      sendEmbed(q.textChannel, '❌ Skipped', `Could not play **${track.title}**`, 0xe74c3c);
+      setTimeout(() => playNext(guildId), 1000);
+    }
   }
 }
 
-async function sendNowPlaying(q, track) {
-  const embed = new EmbedBuilder()
-    .setColor(0x5865f2)
-    .setTitle('🎵 Now Playing')
-    .setDescription(`**[${track.title}](${track.url})**`)
-    .addFields(
-      { name: '⏱️ Duration', value: track.duration || '?:??', inline: true },
-      { name: '🔊 Volume', value: `${q.volume}%`, inline: true },
-      { name: '🔁 Loop', value: q.loop ? 'Track' : q.loopQueue ? 'Queue' : 'Off', inline: true },
-    )
-    .setFooter({ text: `Source: ${track.source.toUpperCase()} • ${q.tracks.length} track(s) in queue` });
-
-  if (track.thumbnail) embed.setThumbnail(track.thumbnail);
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId('queue').setEmoji('📋').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('loop').setEmoji('🔁').setStyle(ButtonStyle.Primary),
-  );
-
-  try {
-    if (q.nowPlayingMsg) await q.nowPlayingMsg.delete().catch(() => {});
-    q.nowPlayingMsg = await q.textChannel.send({ embeds: [embed], components: [row] });
-  } catch {}
-}
-
-function sendEmbed(channel, title, desc, color = 0x5865f2) {
-  if (!channel) return;
-  channel.send({ embeds: [new EmbedBuilder().setColor(color).setTitle(title).setDescription(desc)] }).catch(() => {});
-}
-
-// ─── Join + Setup Player ─────────────────────────────────────────────────────
 function setupPlayer(guildId) {
   const q = getQueue(guildId);
   if (q.player) return q.player;
 
-  const player = createAudioPlayer();
+  const player = createAudioPlayer({
+    behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+  });
   q.player = player;
 
-  player.on(AudioPlayerStatus.Idle, () => playNext(guildId));
-  player.on('error', (err) => {
-    console.error('Player error:', err);
-    playNext(guildId);
+  player.on(AudioPlayerStatus.Idle, () => setTimeout(() => playNext(guildId), 500));
+  player.on('error', err => {
+    console.error('Player error:', err.message);
+    setTimeout(() => playNext(guildId), 1000);
   });
 
   return player;
 }
 
-async function joinChannel(voiceChannel, guildId) {
+// ─── Voice Connection ─────────────────────────────────────────────────────────
+async function connectToChannel(voiceChannel, guildId) {
   const q = getQueue(guildId);
 
-  // If already connected, reuse
+  // Destroy stale connection
   if (q.connection) {
-    const status = q.connection.state.status;
-    if (status !== VoiceConnectionStatus.Destroyed) {
-      const player = setupPlayer(guildId);
-      q.connection.subscribe(player);
-      return q.connection;
+    const s = q.connection.state.status;
+    if (s !== VoiceConnectionStatus.Destroyed) {
+      if (s === VoiceConnectionStatus.Ready || s === VoiceConnectionStatus.Signalling || s === VoiceConnectionStatus.Connecting) {
+        // Already connected or connecting — reuse
+        const player = setupPlayer(guildId);
+        q.connection.subscribe(player);
+        return q.connection;
+      }
+      q.connection.destroy();
     }
+    q.connection = null;
   }
+
+  console.log(`Joining voice channel ${voiceChannel.id} in guild ${guildId}`);
 
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
-    guildId,
+    guildId: guildId,
     adapterCreator: voiceChannel.guild.voiceAdapterCreator,
     selfDeaf: true,
   });
 
+  // Wait up to 30s for Ready
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 30_000); // increased to 30s
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+    console.log('Voice connection ready!');
   } catch (err) {
+    console.error('Voice connection failed:', err.message);
     connection.destroy();
-    queues.delete(guildId);
-    throw new Error('Could not connect to voice channel');
+    throw new Error('Failed to connect to voice channel');
   }
 
   q.connection = connection;
   const player = setupPlayer(guildId);
   connection.subscribe(player);
 
+  // Reconnect on disconnect
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    console.log('Disconnected — attempting reconnect...');
     try {
       await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+        entersState(connection, VoiceConnectionStatus.Signalling, 10_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 10_000),
       ]);
+      console.log('Reconnected!');
     } catch {
-      connection.destroy();
-      queues.delete(guildId);
+      console.log('Could not reconnect, destroying connection');
+      if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
+      const existingQ = queues.get(guildId);
+      if (existingQ) { existingQ.connection = null; existingQ.player = null; }
+      sendEmbed(q.textChannel, '🔌 Disconnected', 'Lost connection! Use `/play` to reconnect.', 0xe74c3c);
     }
   });
 
   return connection;
 }
-// ─── Slash Commands ──────────────────────────────────────────────────────────
-const commands = [
-  new SlashCommandBuilder().setName('play').setDescription('Play music from YouTube, Spotify, SoundCloud, or search query')
-    .addStringOption(o => o.setName('query').setDescription('Song name, URL (YouTube/Spotify/SoundCloud)').setRequired(true)),
-  new SlashCommandBuilder().setName('skip').setDescription('Skip the current track'),
-  new SlashCommandBuilder().setName('stop').setDescription('Stop music and clear the queue'),
-  new SlashCommandBuilder().setName('pause').setDescription('Pause playback'),
-  new SlashCommandBuilder().setName('resume').setDescription('Resume playback'),
-  new SlashCommandBuilder().setName('queue').setDescription('Show the current queue'),
-  new SlashCommandBuilder().setName('nowplaying').setDescription('Show the currently playing track'),
-  new SlashCommandBuilder().setName('volume').setDescription('Set volume (1–100)')
-    .addIntegerOption(o => o.setName('level').setDescription('Volume level').setMinValue(1).setMaxValue(100).setRequired(true)),
-  new SlashCommandBuilder().setName('loop').setDescription('Toggle loop mode')
-    .addStringOption(o => o.setName('mode').setDescription('Loop mode').setRequired(true)
-      .addChoices({ name: 'Off', value: 'off' }, { name: 'Track', value: 'track' }, { name: 'Queue', value: 'queue' })),
-  new SlashCommandBuilder().setName('shuffle').setDescription('Shuffle the queue'),
-  new SlashCommandBuilder().setName('remove').setDescription('Remove a track from the queue')
-    .addIntegerOption(o => o.setName('position').setDescription('Track position (1-based)').setMinValue(1).setRequired(true)),
-  new SlashCommandBuilder().setName('seek').setDescription('Seek to a position in the current track')
-    .addIntegerOption(o => o.setName('seconds').setDescription('Seconds to seek to').setMinValue(0).setRequired(true)),
-  new SlashCommandBuilder().setName('leave').setDescription('Disconnect the bot from voice'),
-  new SlashCommandBuilder().setName('help').setDescription('Show all commands'),
-].map(c => c.toJSON());
 
-// ─── Register Commands ────────────────────────────────────────────────────────
-async function registerCommands() {
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+// ─── Embeds ───────────────────────────────────────────────────────────────────
+async function sendNowPlaying(q, track) {
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2).setTitle('🎵 Now Playing')
+    .setDescription(`**[${track.title}](${track.url})**`)
+    .addFields(
+      { name: '⏱️ Duration', value: track.duration || '?:??', inline: true },
+      { name: '🔊 Volume', value: `${q.volume}%`, inline: true },
+      { name: '🔁 Loop', value: q.loop ? 'Track' : q.loopQueue ? 'Queue' : 'Off', inline: true },
+    )
+    .setFooter({ text: `${track.source.toUpperCase()} • ${q.tracks.length} in queue` });
+  if (track.thumbnail) embed.setThumbnail(track.thumbnail);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('btn_pause').setEmoji('⏸️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('btn_skip').setEmoji('⏭️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('btn_stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('btn_queue').setEmoji('📋').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('btn_loop').setEmoji('🔁').setStyle(ButtonStyle.Primary),
+  );
+
   try {
-    console.log('Registering slash commands...');
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
-    console.log('✅ Slash commands registered!');
-  } catch (err) {
-    console.error('Command registration error:', err);
-  }
+    if (q.nowPlayingMsg) await q.nowPlayingMsg.delete().catch(() => {});
+    q.nowPlayingMsg = await q.textChannel.send({ embeds: [embed], components: [row] });
+  } catch (e) { console.error('sendNowPlaying error:', e.message); }
 }
 
-// ─── Interaction Handler ──────────────────────────────────────────────────────
-client.on('interactionCreate', async (interaction) => {
+function sendEmbed(ch, title, desc, color = 0x5865f2) {
+  if (!ch) return;
+  ch.send({ embeds: [new EmbedBuilder().setColor(color).setTitle(title).setDescription(desc)] }).catch(() => {});
+}
+
+// ─── Slash Commands ───────────────────────────────────────────────────────────
+const commands = [
+  new SlashCommandBuilder().setName('play').setDescription('Play music from YouTube, Spotify, SoundCloud or search')
+    .addStringOption(o => o.setName('query').setDescription('Song name or URL').setRequired(true)),
+  new SlashCommandBuilder().setName('skip').setDescription('Skip current track'),
+  new SlashCommandBuilder().setName('stop').setDescription('Stop and clear queue'),
+  new SlashCommandBuilder().setName('pause').setDescription('Pause'),
+  new SlashCommandBuilder().setName('resume').setDescription('Resume'),
+  new SlashCommandBuilder().setName('queue').setDescription('Show queue'),
+  new SlashCommandBuilder().setName('nowplaying').setDescription('Current track'),
+  new SlashCommandBuilder().setName('volume').setDescription('Set volume (1-100)')
+    .addIntegerOption(o => o.setName('level').setDescription('Volume').setMinValue(1).setMaxValue(100).setRequired(true)),
+  new SlashCommandBuilder().setName('loop').setDescription('Loop mode')
+    .addStringOption(o => o.setName('mode').setDescription('Mode').setRequired(true)
+      .addChoices({ name: 'Off', value: 'off' }, { name: 'Track', value: 'track' }, { name: 'Queue', value: 'queue' })),
+  new SlashCommandBuilder().setName('shuffle').setDescription('Shuffle queue'),
+  new SlashCommandBuilder().setName('remove').setDescription('Remove track')
+    .addIntegerOption(o => o.setName('position').setDescription('Position').setMinValue(1).setRequired(true)),
+  new SlashCommandBuilder().setName('leave').setDescription('Disconnect'),
+  new SlashCommandBuilder().setName('help').setDescription('All commands'),
+].map(c => c.toJSON());
+
+async function registerCommands() {
+  try {
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
+    console.log('✅ Commands registered!');
+  } catch (e) { console.error('Register error:', e.message); }
+}
+
+// ─── Event Handler ────────────────────────────────────────────────────────────
+client.on('interactionCreate', async interaction => {
   const guildId = interaction.guildId;
 
-  // ── Button Handler ──
   if (interaction.isButton()) {
     const q = getQueue(guildId);
     await interaction.deferUpdate().catch(() => {});
-
-    if (interaction.customId === 'pause') {
-      if (q.player?.state.status === AudioPlayerStatus.Playing) q.player.pause();
-      else q.player?.unpause();
-    } else if (interaction.customId === 'skip') {
+    if (interaction.customId === 'btn_pause') {
+      q.player?.state.status === AudioPlayerStatus.Playing ? q.player.pause() : q.player?.unpause();
+    } else if (interaction.customId === 'btn_skip') {
       q.player?.stop();
-    } else if (interaction.customId === 'stop') {
-      q.tracks = [];
-      q.loop = false;
-      q.loopQueue = false;
-      q.player?.stop();
-      q.connection?.destroy();
-      queues.delete(guildId);
-    } else if (interaction.customId === 'queue') {
+    } else if (interaction.customId === 'btn_stop') {
+      q.tracks = []; q.loop = false; q.loopQueue = false;
+      q.player?.stop(); q.connection?.destroy(); queues.delete(guildId);
+    } else if (interaction.customId === 'btn_queue') {
       await showQueue(interaction, q, true);
-    } else if (interaction.customId === 'loop') {
+    } else if (interaction.customId === 'btn_loop') {
       if (!q.loop && !q.loopQueue) q.loop = true;
       else if (q.loop) { q.loop = false; q.loopQueue = true; }
-      else { q.loopQueue = false; }
+      else q.loopQueue = false;
     }
     return;
   }
 
   if (!interaction.isChatInputCommand()) return;
-
   const q = getQueue(guildId);
   const { commandName, options, member, channel } = interaction;
 
   if (commandName === 'help') {
-    const embed = new EmbedBuilder()
-      .setColor(0x5865f2)
-      .setTitle('🎵 Music Bot Commands')
-      .setDescription([
-        '`/play <query or URL>` — Play from YouTube, Spotify, SoundCloud, or search',
-        '`/skip` — Skip current track',
-        '`/stop` — Stop and clear queue',
-        '`/pause` / `/resume` — Pause or resume',
-        '`/queue` — Show queue',
-        '`/nowplaying` — Show current track',
-        '`/volume <1-100>` — Set volume',
-        '`/loop <off|track|queue>` — Set loop mode',
-        '`/shuffle` — Shuffle queue',
-        '`/remove <pos>` — Remove track from queue',
-        '`/seek <seconds>` — Seek in track',
-        '`/leave` — Disconnect bot',
-      ].join('\n'))
-      .setFooter({ text: 'Supports: YouTube • YouTube Music • Spotify • SoundCloud • Search' });
-    return interaction.reply({ embeds: [embed] });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎵 Commands')
+      .setDescription('`/play` • `/skip` • `/stop` • `/pause` • `/resume`\n`/queue` • `/nowplaying` • `/volume` • `/loop`\n`/shuffle` • `/remove` • `/leave`')
+      .setFooter({ text: 'Supports: YouTube • Spotify • SoundCloud • Search' })] });
   }
 
- if (commandName === 'play') {
+  if (commandName === 'play') {
     const query = options.getString('query');
-    const voiceChannel = member.voice?.channel;
-    if (!voiceChannel) return interaction.reply({ content: '❌ Join a voice channel first!', ephemeral: true });
+    const vc = member.voice?.channel;
+    if (!vc) return interaction.reply({ content: '❌ Join a voice channel first!', ephemeral: true });
 
-    // Defer IMMEDIATELY before anything else
     try { await interaction.deferReply(); } catch { return; }
     q.textChannel = channel;
 
     try {
-      if (!q.connection) await joinChannel(voiceChannel, guildId);
+      await connectToChannel(vc, guildId);
     } catch (err) {
-      console.error('Join error:', err);
-      return interaction.editReply('❌ Could not join your voice channel. Try again!');
+      console.error('Connect error:', err.message);
+      return interaction.editReply('❌ Could not join voice channel. Make sure I have permission and try again!');
     }
-    const tracks = await resolveTracks(query);
-    if (!tracks || !tracks.length) return interaction.editReply('❌ No results found.');
+
+    const tracks = await resolveTracks(query).catch(e => { console.error(e); return null; });
+    if (!tracks?.length) return interaction.editReply('❌ No results found. Try a different search!');
 
     q.tracks.push(...tracks);
 
-    const isPlaylist = tracks.length > 1;
     const embed = new EmbedBuilder().setColor(0x5865f2);
-
-    if (isPlaylist) {
+    if (tracks.length > 1) {
       embed.setTitle('📋 Playlist Added').setDescription(`Added **${tracks.length} tracks** to the queue`);
     } else {
       embed.setTitle('✅ Added to Queue').setDescription(`**[${tracks[0].title}](${tracks[0].url})**`)
         .addFields({ name: '⏱️ Duration', value: tracks[0].duration || '?:??', inline: true });
       if (tracks[0].thumbnail) embed.setThumbnail(tracks[0].thumbnail);
     }
-
     await interaction.editReply({ embeds: [embed] });
 
-    if (q.player?.state.status !== AudioPlayerStatus.Playing) playNext(guildId);
+    if (!q.player || q.player.state.status === AudioPlayerStatus.Idle) playNext(guildId);
     return;
   }
 
   if (commandName === 'skip') {
-    if (!q.player) return interaction.reply({ content: '❌ Nothing playing.', ephemeral: true });
-    q.player.stop();
+    if (!q.current) return interaction.reply({ content: '❌ Nothing playing.', ephemeral: true });
+    q.player?.stop();
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription('⏭️ Skipped!')] });
   }
-
   if (commandName === 'stop') {
-    q.tracks = [];
-    q.loop = false;
-    q.loopQueue = false;
-    q.player?.stop();
-    q.connection?.destroy();
-    queues.delete(guildId);
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xe74c3c).setDescription('⏹️ Stopped and disconnected.')] });
+    q.tracks = []; q.loop = false; q.loopQueue = false;
+    q.player?.stop(); q.connection?.destroy(); queues.delete(guildId);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xe74c3c).setDescription('⏹️ Stopped.')] });
   }
-
   if (commandName === 'pause') {
     q.player?.pause();
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xf1c40f).setDescription('⏸️ Paused.')] });
   }
-
   if (commandName === 'resume') {
     q.player?.unpause();
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x2ecc71).setDescription('▶️ Resumed.')] });
   }
-
-  if (commandName === 'queue') {
-    return showQueue(interaction, q);
-  }
-
+  if (commandName === 'queue') return showQueue(interaction, q);
   if (commandName === 'nowplaying') {
     if (!q.current) return interaction.reply({ content: '❌ Nothing playing.', ephemeral: true });
     const t = q.current;
-    const embed = new EmbedBuilder().setColor(0x5865f2).setTitle('🎵 Now Playing')
+    const e = new EmbedBuilder().setColor(0x5865f2).setTitle('🎵 Now Playing')
       .setDescription(`**[${t.title}](${t.url})**`)
-      .addFields(
-        { name: '⏱️ Duration', value: t.duration || '?:??', inline: true },
-        { name: '🔊 Volume', value: `${q.volume}%`, inline: true },
-        { name: '🔁 Loop', value: q.loop ? 'Track' : q.loopQueue ? 'Queue' : 'Off', inline: true },
-      );
-    if (t.thumbnail) embed.setThumbnail(t.thumbnail);
-    return interaction.reply({ embeds: [embed] });
+      .addFields({ name: '⏱️', value: t.duration||'?:??', inline:true }, { name: '🔊', value: `${q.volume}%`, inline:true }, { name: '🔁', value: q.loop?'Track':q.loopQueue?'Queue':'Off', inline:true });
+    if (t.thumbnail) e.setThumbnail(t.thumbnail);
+    return interaction.reply({ embeds: [e] });
   }
-
   if (commandName === 'volume') {
     const level = options.getInteger('level');
     q.volume = level;
-    if (q.player?.state?.resource?.volume) {
-      q.player.state.resource.volume.setVolume(level / 100);
-    }
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(`🔊 Volume set to **${level}%**`)] });
+    if (q.player?.state?.resource?.volume) q.player.state.resource.volume.setVolume(level / 100);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(`🔊 Volume: **${level}%**`)] });
   }
-
   if (commandName === 'loop') {
     const mode = options.getString('mode');
-    q.loop = mode === 'track';
-    q.loopQueue = mode === 'queue';
-    const labels = { off: '🔁 Loop **disabled**', track: '🔂 Looping **current track**', queue: '🔁 Looping **queue**' };
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(labels[mode])] });
+    q.loop = mode === 'track'; q.loopQueue = mode === 'queue';
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(
+      mode==='off'?'🔁 Loop off':mode==='track'?'🔂 Looping track':'🔁 Looping queue'
+    )] });
   }
-
   if (commandName === 'shuffle') {
-    for (let i = q.tracks.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [q.tracks[i], q.tracks[j]] = [q.tracks[j], q.tracks[i]];
-    }
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription('🔀 Queue shuffled!')] });
+    for (let i=q.tracks.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[q.tracks[i],q.tracks[j]]=[q.tracks[j],q.tracks[i]];}
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription('🔀 Shuffled!')] });
   }
-
   if (commandName === 'remove') {
     const pos = options.getInteger('position') - 1;
     if (pos < 0 || pos >= q.tracks.length) return interaction.reply({ content: '❌ Invalid position.', ephemeral: true });
-    const [removed] = q.tracks.splice(pos, 1);
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xe74c3c).setDescription(`🗑️ Removed **${removed.title}**`)] });
+    const [r] = q.tracks.splice(pos, 1);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xe74c3c).setDescription(`🗑️ Removed **${r.title}**`)] });
   }
-
   if (commandName === 'leave') {
-    q.connection?.destroy();
-    queues.delete(guildId);
-    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription('👋 Disconnected!')] });
+    q.connection?.destroy(); queues.delete(guildId);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription('👋 Bye!')] });
   }
 });
 
 async function showQueue(interaction, q, isButton = false) {
   if (!q.current && !q.tracks.length) {
-    const reply = { content: '❌ The queue is empty!', ephemeral: true };
-    return isButton ? interaction.followUp(reply) : interaction.reply(reply);
+    const r = { content: '❌ Queue is empty!', ephemeral: true };
+    return isButton ? interaction.followUp(r) : interaction.reply(r);
   }
-
   const lines = [];
-  if (q.current) lines.push(`**▶️ Now:** [${q.current.title}](${q.current.url}) \`${q.current.duration || '?:??'}\``);
-  q.tracks.slice(0, 15).forEach((t, i) => {
-    lines.push(`**${i + 1}.** [${t.title}](${t.url}) \`${t.duration || '?:??'}\``);
-  });
-  if (q.tracks.length > 15) lines.push(`...and **${q.tracks.length - 15}** more tracks`);
-
-  const embed = new EmbedBuilder().setColor(0x5865f2)
-    .setTitle('📋 Queue')
-    .setDescription(lines.join('\n') || 'Empty')
-    .setFooter({ text: `${q.tracks.length} track(s) • Loop: ${q.loop ? 'Track' : q.loopQueue ? 'Queue' : 'Off'}` });
-
-  const reply = { embeds: [embed], ephemeral: isButton };
-  return isButton ? interaction.followUp(reply) : interaction.reply(reply);
+  if (q.current) lines.push(`**▶️ Now:** [${q.current.title}](${q.current.url}) \`${q.current.duration||'?:??'}\``);
+  q.tracks.slice(0,15).forEach((t,i) => lines.push(`**${i+1}.** [${t.title}](${t.url}) \`${t.duration||'?:??'}\``));
+  if (q.tracks.length > 15) lines.push(`...and **${q.tracks.length-15}** more`);
+  const e = new EmbedBuilder().setColor(0x5865f2).setTitle('📋 Queue').setDescription(lines.join('\n')||'Empty')
+    .setFooter({ text: `${q.tracks.length} track(s) • Loop: ${q.loop?'Track':q.loopQueue?'Queue':'Off'}` });
+  const r = { embeds: [e], ephemeral: isButton };
+  return isButton ? interaction.followUp(r) : interaction.reply(r);
 }
 
-// ─── Boot ────────────────────────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────────────────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   client.user.setActivity('🎵 /play to start', { type: 2 });
